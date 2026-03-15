@@ -1,8 +1,8 @@
-# @seriouslag/actual-auto-sync
+# @slushpupie/actual-auto-sync
 
-[![Docker Image Version](https://img.shields.io/docker/v/seriouslag/actual-auto-sync?style=flat&label=Docker%20Image%20Version&link=https%3A%2F%2Fhub.docker.com%2Fr%2Fseriouslag%2Factual-auto-sync)](https://hub.docker.com/r/seriouslag/actual-auto-sync)
-[![Code Coverage](https://codecov.io/github/seriouslag/actual-auto-sync/branch/main/graph/badge.svg?token=TPQPYMHI7S)](https://codecov.io/github/seriouslag/actual-auto-sync)
-[![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/seriouslag)
+[![Docker Image Version](https://img.shields.io/github/v/release/slushpupie/actual-auto-sync?style=flat&label=Docker%20Image%20Version&link=https%3A%2F%2Fgithub.com%2Fslushpupie%2Factual-auto-sync%2Fpkgs%2Fcontainer%2Factual-auto-sync)](https://github.com/slushpupie/actual-auto-sync/pkgs/container/actual-auto-sync)
+[![Code Coverage](https://codecov.io/github/slushpupie/actual-auto-sync/branch/main/graph/badge.svg?token=TPQPYMHI7S)](https://codecov.io/github/slushpupie/actual-auto-sync)
+[![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/slushpupie)
 
 A background service that automatically runs the bank sync on a scheduled basis on Actual Budget.
 
@@ -62,7 +62,7 @@ services:
   ...
 ```
 
-## Running with Docker (pull from docker hub)
+## Running with Docker (pull from GitHub Container Registry)
 
 Published tags include:
 
@@ -78,7 +78,7 @@ For a pull request, maintainers can comment:
 /publish-test-image
 ```
 
-The workflow will publish a test image with a tag like `seriouslag/actual-auto-sync:pr-<pr-number>-<sha8>` and reply on the PR with the full image name.
+The workflow will publish a test image with a tag like `ghcr.io/slushpupie/actual-auto-sync:pr-<pr-number>-<sha8>` and reply on the PR with the full image name.
 
 ### direct docker run
 
@@ -92,7 +92,7 @@ docker run -d \
   -e ENCRYPTION_PASSWORDS="password1" \
   -e TIMEZONE="Etc/UTC" \
   -e RUN_ON_START="false" \
-  seriouslag/actual-auto-sync:latest
+  ghcr.io/slushpupie/actual-auto-sync:latest
 ```
 
 ### Running with docker compose
@@ -101,7 +101,7 @@ docker run -d \
 services:
 ...
   actual-auto-sync:
-    image: seriouslag/actual-auto-sync:latest
+    image: ghcr.io/slushpupie/actual-auto-sync:latest
     environment:
       - ACTUAL_SERVER_URL=your-server-url
       - ACTUAL_SERVER_PASSWORD=your-password
@@ -119,7 +119,7 @@ services:
 services:
 ...
   actual-auto-sync:
-    image: seriouslag/actual-auto-sync:latest
+    image: ghcr.io/slushpupie/actual-auto-sync:latest
     secrets:
       - actual_budget_sync_id
       - actual_server_password
@@ -205,7 +205,7 @@ A: Double-check `ACTUAL_SERVER_PASSWORD`. For HTTPS connection errors, keep TLS 
 services:
   ...
   actual-auto-sync:
-    image: seriouslag/actual-auto-sync:latest
+    image: ghcr.io/slushpupie/actual-auto-sync:latest
     restart: unless-stopped
     environment:
       - ACTUAL_SERVER_URL=https://<your-local-actual-budget-url>:<your-actual-budget-port>
