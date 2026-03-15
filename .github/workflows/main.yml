@@ -15,6 +15,9 @@ concurrency:
 jobs:
   build-test-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v6
@@ -101,20 +104,44 @@ jobs:
           }
 
           const versionPattern = new RegExp(`^${baseVersion.replace(/\./g, "\\.")}\\.(\\d+)$`);
-          let nextUrl = "https://hub.docker.com/v2/repositories/seriouslag/actual-auto-sync/tags?page_size=100";
           let maxInternalRelease = 0;
 
           (async () => {
+            // 1. Get anonymous token for ghcr.io
+            const tokenRes = await fetch("https://ghcr.io/token?scope=repository:slushpupie/actual-auto-sync:pull");
+            if (!tokenRes.ok) {
+               console.error(`Failed to get ghcr token: ${tokenRes.status}`);
+               process.exit(1);
+            }
+            const { token } = await tokenRes.json();
+
+            // 2. Fetch tags
+            let nextUrl = "https://ghcr.io/v2/slushpupie/actual-auto-sync/tags/list";
+            
             while (nextUrl) {
-              const response = await fetch(nextUrl);
+              const response = await fetch(nextUrl, {
+                headers: { Authorization: `Bearer ${token}` }
+              });
+              
+              if (response.status === 404) {
+                 // Repository doesn't exist yet, start at 1
+                 break;
+              }
+              
               if (!response.ok) {
-                throw new Error(`Docker Hub API request failed with status ${response.status}`);
+                 const errBody = await response.text();
+                 
+                 // Handle specific NAME_UNKNOWN error from GHCR when repo is fully empty/new
+                 if (errBody.includes('NAME_UNKNOWN')) {
+                    break;
+                 }
+                throw new Error(`GHCR API request failed with status ${response.status}: ${errBody}`);
               }
 
               const payload = await response.json();
 
-              for (const tag of payload.results ?? []) {
-                const match = versionPattern.exec(tag.name);
+              for (const tag of payload.tags ?? []) {
+                const match = versionPattern.exec(tag);
                 if (!match) {
                   continue;
                 }
@@ -125,7 +152,11 @@ jobs:
                 }
               }
 
-              nextUrl = payload.next;
+              // GHCR pagination usually relies on Link headers, but for simple use cases
+              // or initial setups, tags list is small. 
+              // We will just process the first page (up to 10k tags typically for registry v2)
+              // https://docs.docker.com/registry/spec/api/#listing-image-tags
+              nextUrl = null; 
             }
 
             process.stdout.write(String(maxInternalRelease + 1));
@@ -151,10 +182,10 @@ jobs:
         id: docker_tags
         shell: bash
         run: |
-          TAGS="seriouslag/actual-auto-sync:latest
-          seriouslag/actual-auto-sync:${{ steps.commit_hash.outputs.hash }}
-          seriouslag/actual-auto-sync:${{ steps.internal_release.outputs.version }}
-          seriouslag/actual-auto-sync:v${{ steps.internal_release.outputs.version }}"
+          TAGS="ghcr.io/slushpupie/actual-auto-sync:latest
+          ghcr.io/slushpupie/actual-auto-sync:${{ steps.commit_hash.outputs.hash }}
+          ghcr.io/slushpupie/actual-auto-sync:${{ steps.internal_release.outputs.version }}
+          ghcr.io/slushpupie/actual-auto-sync:v${{ steps.internal_release.outputs.version }}"
 
           {
             echo "tags<<EOF"
@@ -165,11 +196,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: seriouslag
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
