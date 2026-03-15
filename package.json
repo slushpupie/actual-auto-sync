@@ -1,6 +1,6 @@
 {
-  "name": "@seriouslag/actual-auto-sync",
-  "version": "0.0.1",
+  "name": "@slushpupie/actual-auto-sync",
+  "version": "0.0.2",
   "description": "A background service that automatically syncs your Actual Budget accounts on a scheduled basis.",
   "keywords": [
     "actual",
