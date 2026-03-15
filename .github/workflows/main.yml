@@ -94,6 +94,7 @@ jobs:
         shell: bash
         env:
           BASE_VERSION: ${{ steps.actual_budget_version.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           INTERNAL_RELEASE_NUMBER=$(node <<'NODE'
           const baseVersion = process.env.BASE_VERSION;
@@ -107,10 +108,20 @@ jobs:
           let maxInternalRelease = 0;
 
           (async () => {
+            const githubToken = process.env.GITHUB_TOKEN;
+            if (!githubToken) {
+               console.error("Missing GITHUB_TOKEN");
+               process.exit(1);
+            }
+
             // 1. Get anonymous token for ghcr.io
-            const tokenRes = await fetch("https://ghcr.io/token?scope=repository:slushpupie/actual-auto-sync:pull");
+            const authStr = Buffer.from(`${process.env.GITHUB_ACTOR}:${githubToken}`).toString('base64');
+            const tokenRes = await fetch("https://ghcr.io/token?scope=repository:slushpupie/actual-auto-sync:pull", {
+               headers: { Authorization: `Basic ${authStr}` }
+            });
+
             if (!tokenRes.ok) {
-               console.error(`Failed to get ghcr token: ${tokenRes.status}`);
+               console.error(`Failed to get ghcr token: ${tokenRes.status} ${await tokenRes.text()}`);
                process.exit(1);
             }
             const { token } = await tokenRes.json();
