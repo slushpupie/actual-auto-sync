@@ -18,7 +18,7 @@ export async function getConfiguration(envName: string): Promise<string | undefi
     if (typeof secret === 'string') {
       return secret;
     }
-    throw new Error(`environment variable ${secretName} (${path}) is not a file`);
+    throw new Error(`environment variable ${secretName} does not point to a valid file`);
   }
   if (envName in process.env && process.env[envName]) {
     return process.env[envName];

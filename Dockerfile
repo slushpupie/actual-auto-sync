@@ -19,6 +19,7 @@ COPY --from=build /app/node_modules /app/node_modules
 COPY --from=build /app/dist /app/dist
 
 # Environment variables
+ENV NODE_ENV=production
 ENV ACTUAL_SERVER_URL=""
 # once a day at 1am in America/New_York
 ENV CRON_SCHEDULE="0 1 * * *" 
@@ -26,6 +27,10 @@ ENV LOG_LEVEL="info"
 ENV ACTUAL_BUDGET_SYNC_IDS=""
 ENV ENCRYPTION_PASSWORDS=""
 ENV TIMEZONE="America/New_York"
+
+# Use the non-root node user provided by the base image
+RUN mkdir -p /app/data && chown -R node:node /app
+USER node
 
 # Start the application
 CMD ["node", "dist/src/index.js"]

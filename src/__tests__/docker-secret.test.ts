@@ -69,7 +69,7 @@ describe('docker secret', () => {
     }));
 
     process.env[envVarFile] = secretPath;
-    const message = `environment variable ${envVarFile} (${secretPath}) is not a file`;
+    const message = `environment variable ${envVarFile} does not point to a valid file`;
 
     await expect(() => import('../env.js')).rejects.toThrow(message);
   });

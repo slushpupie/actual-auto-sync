@@ -1,17 +1,21 @@
 # E2E Test Dockerfile
 FROM node:24.13.0-slim
 
-# Install build dependencies for native modules (better-sqlite3)
+# Install build dependencies for native modules (better-sqlite3) and curl for health check
 RUN apt-get update && apt-get install -y \
     python3 \
     make \
     g++ \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 
 WORKDIR /app
+
+# Ensure app directory is owned by node
+RUN chown -R node:node /app
 
 # Copy package files first for better layer caching
 COPY package.json pnpm-lock.yaml ./
@@ -28,7 +32,10 @@ RUN pnpm rebuild better-sqlite3
 COPY . .
 
 # Create e2e data directory
-RUN mkdir -p /app/e2e-data
+RUN mkdir -p /app/e2e-data && chown -R node:node /app
+
+# Use non-root node user
+USER node
 
 # Run e2e tests
 CMD ["pnpm", "test:e2e"]
