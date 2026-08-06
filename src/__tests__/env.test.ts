@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  actualDataDirSchema,
   budgetIdSchema,
   cronScheduleSchema,
   encryptionPasswordSchema,
   logLevelSchema,
   runOnStartSchema,
   serverPasswordSchema,
+  skipFailedAccountsSchema,
   serverUrlSchema,
   timezoneSchema,
 } from '../env.js';
@@ -24,7 +26,8 @@ vi.mock('pino', () => ({
 }));
 
 vi.mock('@t3-oss/env-core', () => ({
-  createEnv: vi.fn(),
+  // env.ts reads env.LOG_LEVEL after createEnv() to set the logger level.
+  createEnv: vi.fn(() => ({ LOG_LEVEL: 'info' })),
 }));
 
 describe('Environment Configuration', () => {
@@ -186,6 +189,11 @@ describe('Environment Configuration', () => {
         const result = timezoneSchema.parse(undefined);
         expect(result).toBe('Etc/UTC');
       });
+
+      it('should reject invalid IANA timezone strings', () => {
+        expect(() => timezoneSchema.parse('Not/AZone')).toThrow();
+        expect(() => timezoneSchema.parse('invalid')).toThrow();
+      });
     });
 
     describe('RUN_ON_START', () => {
@@ -222,6 +230,45 @@ describe('Environment Configuration', () => {
       it('should use default value when not provided', () => {
         const result = runOnStartSchema.parse(undefined);
         expect(result).toBe(false);
+      });
+    });
+
+    describe('SKIP_FAILED_ACCOUNTS', () => {
+      it('should coerce common truthy/falsy representations to boolean', () => {
+        const testCases = [
+          { input: true, expected: true },
+          { input: 'true', expected: true },
+          { input: '1', expected: true },
+          { input: 'yes', expected: true },
+          { input: 'on', expected: true },
+          { input: false, expected: false },
+          { input: 'false', expected: false },
+          { input: '0', expected: false },
+          { input: '', expected: false },
+          { input: 'nonsense', expected: false },
+        ];
+
+        for (const { input, expected } of testCases) {
+          expect(skipFailedAccountsSchema.parse(input)).toBe(expected);
+        }
+      });
+
+      it('should default to false when not provided', () => {
+        expect(skipFailedAccountsSchema.parse(undefined)).toBe(false);
+      });
+    });
+
+    describe('ACTUAL_DATA_DIR', () => {
+      it('should default to ./data when not provided', () => {
+        expect(actualDataDirSchema.parse(undefined)).toBe('./data');
+      });
+
+      it('should accept and trim a custom path', () => {
+        expect(actualDataDirSchema.parse('  /data  ')).toBe('/data');
+      });
+
+      it('should reject an empty string', () => {
+        expect(() => actualDataDirSchema.parse('')).toThrow();
       });
     });
   });

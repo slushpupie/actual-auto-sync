@@ -2,18 +2,52 @@ import type { Dirent } from 'node:fs';
 import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import * as api from '@actual-app/api';
+import {
+  downloadBudget,
+  getAccounts,
+  init,
+  runBankSync,
+  shutdown,
+  sync as syncBudget,
+} from '@actual-app/api';
 import cronstrue from 'cronstrue';
 
 import { env } from './env.js';
-import { logger } from './logger.js';
+import { isVerbose, logger } from './logger.js';
 
-const ACTUAL_DATA_DIR = './data';
+// Configurable so the writable data dir can live on a mounted/tmpfs path,
+// allowing the container to run with a read-only root filesystem.
+const ACTUAL_DATA_DIR = env.ACTUAL_DATA_DIR;
 // Keep retries small to avoid long loops while still healing transient API/session issues.
 const MAX_BUDGET_SYNC_ATTEMPTS = 2;
 
 export function formatCronSchedule(schedule: string) {
   return cronstrue.toString(schedule).toLowerCase();
+}
+
+// Handle returned by `init()`. The module-level `internal` export is deprecated
+// in favor of this value, so we keep it from the last successful init() call.
+type ActualApi = Awaited<ReturnType<typeof init>>;
+let actualApi: ActualApi | undefined;
+
+/**
+ * Narrow view of the Actual API handle used for CRDT balance writes. Accepting
+ * this subset keeps the balance-sync helpers easy to call with a real `init()`
+ * handle or a lightweight test double.
+ */
+interface BalanceSyncApi {
+  db: {
+    getAccounts: ActualApi['db']['getAccounts'];
+    update: ActualApi['db']['update'];
+  };
+}
+
+/** Returns the live Actual API handle, throwing a clear error if init() has not run. */
+function getActualApi(): ActualApi {
+  if (!actualApi) {
+    throw new Error('Actual API is not initialized; init() must run first.');
+  }
+  return actualApi;
 }
 
 interface AccountBalanceRow {
@@ -25,17 +59,10 @@ interface AccountBalanceSyncInput {
   readFailed: boolean;
 }
 
-function getApi() {
-  if (!api.internal) {
-    throw new Error('API not initialized. Call init() first.');
-  }
-  return api.internal;
-}
-
-async function getAccountsForBalanceSync(): Promise<AccountBalanceSyncInput> {
+async function getAccountsForBalanceSync(api: BalanceSyncApi): Promise<AccountBalanceSyncInput> {
   try {
     return {
-      accounts: (await getApi().db.getAccounts()) as AccountBalanceRow[],
+      accounts: (await api.db.getAccounts()) as AccountBalanceRow[],
       readFailed: false,
     };
   } catch (error) {
@@ -47,9 +74,12 @@ async function getAccountsForBalanceSync(): Promise<AccountBalanceSyncInput> {
   }
 }
 
-async function syncAccountBalanceToCRDT(account: AccountBalanceRow): Promise<boolean> {
+async function syncAccountBalanceToCRDT(
+  api: BalanceSyncApi,
+  account: AccountBalanceRow,
+): Promise<boolean> {
   try {
-    await getApi().db.update('accounts', {
+    await api.db.update('accounts', {
       id: account.id,
       balance_current: account.balance_current,
     });
@@ -64,8 +94,8 @@ async function syncAccountBalanceToCRDT(account: AccountBalanceRow): Promise<boo
 }
 
 /** Persists current numeric account balances via CRDT row updates for the loaded budget. */
-export async function syncAccountBalancesToCRDT() {
-  const { accounts, readFailed } = await getAccountsForBalanceSync();
+export async function syncAccountBalancesToCRDT(api: BalanceSyncApi) {
+  const { accounts, readFailed } = await getAccountsForBalanceSync(api);
   if (readFailed) {
     return false;
   }
@@ -73,7 +103,7 @@ export async function syncAccountBalancesToCRDT() {
   let hasSyncErrors = false;
   for (const account of accounts) {
     if (typeof account.balance_current === 'number') {
-      const synced = await syncAccountBalanceToCRDT(account);
+      const synced = await syncAccountBalanceToCRDT(api, account);
       if (!synced) {
         hasSyncErrors = true;
       }
@@ -83,12 +113,46 @@ export async function syncAccountBalancesToCRDT() {
   return !hasSyncErrors;
 }
 
-async function syncBankAccounts() {
+/**
+ * Runs bank sync per account, skipping (and logging) any that fail so one bad
+ * account does not abort the rest. Returns the names/ids of accounts that failed.
+ */
+async function runBankSyncSkippingFailures(): Promise<string[]> {
+  const accounts = (await getAccounts()).filter((account) => !account.closed);
+  const failedAccounts: string[] = [];
+
+  for (const account of accounts) {
+    const label = account.name || account.id;
+    try {
+      await runBankSync({ accountId: account.id });
+    } catch (error) {
+      failedAccounts.push(label);
+      logger.error(
+        { err: error, accountId: account.id, accountName: account.name },
+        `Bank sync failed for account "${label}"; skipping.`,
+      );
+    }
+  }
+
+  return failedAccounts;
+}
+
+async function syncBankAccounts(api: BalanceSyncApi) {
   logger.info('Syncing all accounts...');
-  await api.runBankSync();
+  if (env.SKIP_FAILED_ACCOUNTS) {
+    const failedAccounts = await runBankSyncSkippingFailures();
+    if (failedAccounts.length > 0) {
+      logger.warn(
+        { failedAccounts },
+        `Bank sync completed with ${failedAccounts.length} failed account(s): ${failedAccounts.join(', ')}.`,
+      );
+    }
+  } else {
+    await runBankSync();
+  }
   logger.info('All accounts synced.');
   logger.info('Syncing account balances through CRDT...');
-  const syncedBalances = await syncAccountBalancesToCRDT();
+  const syncedBalances = await syncAccountBalancesToCRDT(api);
   if (syncedBalances) {
     logger.info('Account balances synced through CRDT.');
   } else {
@@ -98,14 +162,14 @@ async function syncBankAccounts() {
 
 async function syncBudgetToServer() {
   logger.info('Syncing budget to server...');
-  await api.sync();
+  await syncBudget();
   logger.info('Budget synced to server successfully.');
 }
 
 /** Runs bank sync, then pushes synced balance state to the server for the loaded budget. */
-export async function syncAllAccounts() {
+export async function syncAllAccounts(api: BalanceSyncApi) {
   // Runs against the currently loaded budget in the Actual API session.
-  await syncBankAccounts();
+  await syncBankAccounts(api);
   await syncBudgetToServer();
 }
 
@@ -115,10 +179,12 @@ async function createDataDirAndInitApi() {
     await mkdir(ACTUAL_DATA_DIR, { recursive: true });
     logger.info('Data directory created successfully.');
     logger.info('Initializing Actual API...');
-    await api.init({
+    actualApi = await init({
       dataDir: ACTUAL_DATA_DIR,
       serverURL: env.ACTUAL_SERVER_URL,
       password: env.ACTUAL_SERVER_PASSWORD,
+      // Silence @actual-app/api's verbose console output unless LOG_LEVEL opts in.
+      verbose: isVerbose(env.LOG_LEVEL),
     });
     logger.info('Actual API initialized successfully.');
   } catch (error) {
@@ -186,7 +252,7 @@ async function removeLocalBudgetCacheBySyncId(syncId: string) {
 async function resetApiSessionForRetry(syncId: string) {
   logger.info(`Resetting Actual API session before retrying budget ${syncId}...`);
   try {
-    await api.shutdown();
+    await shutdown();
   } catch (error) {
     logger.error({ err: error, budgetId: syncId }, 'Error shutting down API during retry reset.');
   }
@@ -206,14 +272,14 @@ async function downloadAndSyncBudget(budgetId: string, index: number) {
         `Downloading budget ${budgetId} (attempt ${attempt}/${MAX_BUDGET_SYNC_ATTEMPTS})...`,
       );
       if (password) {
-        await api.downloadBudget(budgetId, { password });
+        await downloadBudget(budgetId, { password });
       } else {
-        await api.downloadBudget(budgetId);
+        await downloadBudget(budgetId);
       }
       logger.info(`Budget ${budgetId} downloaded successfully.`);
 
       logger.info(`Syncing accounts for budget ${budgetId}...`);
-      await syncAllAccounts();
+      await syncAllAccounts(getActualApi());
       logger.info(`Accounts synced successfully for budget ${budgetId}.`);
       return;
     } catch (error) {
@@ -290,7 +356,8 @@ async function runSyncCycle() {
 
 async function shutdownApi() {
   logger.info('Shutting down...');
-  await api.shutdown();
+  await shutdown();
+  actualApi = undefined;
   logger.info('Shutdown complete.');
 }
 

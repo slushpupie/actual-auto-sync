@@ -1,6 +1,6 @@
 import { readFile, readdir } from 'node:fs/promises';
 
-import { init, runBankSync, sync as syncBudget } from '@actual-app/api';
+import { getAccounts, runBankSync, sync as syncBudget } from '@actual-app/api';
 import cronstrue from 'cronstrue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -23,24 +23,28 @@ vi.mock('node:fs/promises', () => ({
   readFile: vi.fn(),
 }));
 
-const mockDb = vi.hoisted(() => ({
-  getAccounts: vi.fn(),
-  update: vi.fn(),
-}));
-
 vi.mock('@actual-app/api', () => ({
   init: vi.fn(),
   shutdown: vi.fn(),
   runBankSync: vi.fn(),
+  getAccounts: vi.fn(),
   downloadBudget: vi.fn(),
   loadBudget: vi.fn(),
   sync: vi.fn(),
-  internal: { db: mockDb },
 }));
 
 // Import mocked functions
-const { shutdown, downloadBudget } = await import('@actual-app/api');
+const { init, shutdown, downloadBudget } = await import('@actual-app/api');
 const { mkdir, rm } = await import('node:fs/promises');
+
+// `init()` now returns the API handle (the `internal` export is deprecated). The
+// balance-sync helpers only need `db.getAccounts`/`db.update`, so a small double
+// stands in for the real handle, and `init` is stubbed to resolve to it.
+const mockDb = {
+  getAccounts: vi.fn(),
+  update: vi.fn(),
+};
+const fakeApi = { db: mockDb };
 
 vi.mock('cronstrue', () => ({
   default: {
@@ -52,32 +56,45 @@ vi.mock('../env.js', () => ({
   env: {
     ACTUAL_SERVER_URL: 'http://localhost:5006',
     ACTUAL_SERVER_PASSWORD: 'test-password',
+    ACTUAL_DATA_DIR: './data',
     CRON_SCHEDULE: '0 0 * * *',
     ACTUAL_BUDGET_SYNC_IDS: ['budget1', 'budget2'],
     ENCRYPTION_PASSWORDS: ['pass1', 'pass2'],
     TIMEZONE: 'Etc/UTC',
     RUN_ON_START: false,
+    LOG_LEVEL: 'info',
+    SKIP_FAILED_ACCOUNTS: false,
   },
 }));
 
-vi.mock('../logger.js', () => ({
-  logger: {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  },
-}));
+vi.mock('../logger.js', async (importOriginal) => {
+  // Keep the real isVerbose so the verbose flag passed to init() is exercised.
+  const actual = await importOriginal<typeof import('../logger.js')>();
+  return {
+    logger: {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+    isVerbose: actual.isVerbose,
+  };
+});
 
 describe('utils.ts functions', () => {
   const mutableEnv = env as unknown as {
     ACTUAL_BUDGET_SYNC_IDS: string[];
     ENCRYPTION_PASSWORDS: string[];
+    LOG_LEVEL: string;
+    SKIP_FAILED_ACCOUNTS: boolean;
   };
   let cronstrueMock: { toString: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // Reset env knobs that individual tests toggle so ordering can't leak state.
+    mutableEnv.LOG_LEVEL = 'info';
+    mutableEnv.SKIP_FAILED_ACCOUNTS = false;
     cronstrueMock = cronstrue as unknown as {
       toString: ReturnType<typeof vi.fn>;
     };
@@ -107,6 +124,7 @@ describe('utils.ts functions', () => {
 
   describe('syncAllAccounts', () => {
     beforeEach(() => {
+      mutableEnv.SKIP_FAILED_ACCOUNTS = false;
       vi.mocked(mockDb.getAccounts).mockResolvedValue([
         { id: 'acc-1', balance_current: 12_345 },
         { id: 'acc-2', balance_current: null },
@@ -118,9 +136,12 @@ describe('utils.ts functions', () => {
       vi.mocked(runBankSync).mockResolvedValue(undefined);
       vi.mocked(syncBudget).mockResolvedValue(undefined);
 
-      await syncAllAccounts();
+      await syncAllAccounts(fakeApi);
 
       expect(logger.info).toHaveBeenCalledWith('Syncing all accounts...');
+      // Default mode: a single all-accounts sync, no per-account enumeration.
+      expect(runBankSync).toHaveBeenCalledWith();
+      expect(getAccounts).not.toHaveBeenCalled();
       expect(runBankSync).toHaveBeenCalled();
       expect(logger.info).toHaveBeenCalledWith('All accounts synced.');
       expect(logger.info).toHaveBeenCalledWith('Syncing account balances through CRDT...');
@@ -139,7 +160,7 @@ describe('utils.ts functions', () => {
       const error = new Error('Sync failed');
       vi.mocked(runBankSync).mockRejectedValue(error);
 
-      await expect(syncAllAccounts()).rejects.toThrow('Sync failed');
+      await expect(syncAllAccounts(fakeApi)).rejects.toThrow('Sync failed');
 
       expect(syncBudget).not.toHaveBeenCalled();
     });
@@ -149,7 +170,7 @@ describe('utils.ts functions', () => {
       vi.mocked(runBankSync).mockResolvedValue(undefined);
       vi.mocked(syncBudget).mockRejectedValue(error);
 
-      await expect(syncAllAccounts()).rejects.toThrow('Budget sync failed');
+      await expect(syncAllAccounts(fakeApi)).rejects.toThrow('Budget sync failed');
 
       expect(runBankSync).toHaveBeenCalled();
     });
@@ -160,7 +181,7 @@ describe('utils.ts functions', () => {
       vi.mocked(mockDb.getAccounts).mockRejectedValue(error);
       vi.mocked(syncBudget).mockResolvedValue(undefined);
 
-      await syncAllAccounts();
+      await syncAllAccounts(fakeApi);
 
       expect(logger.error).toHaveBeenCalledWith(
         { err: error },
@@ -171,6 +192,91 @@ describe('utils.ts functions', () => {
       );
       expect(syncBudget).toHaveBeenCalled();
       expect(logger.info).toHaveBeenCalledWith('Budget synced to server successfully.');
+    });
+
+    describe('when SKIP_FAILED_ACCOUNTS is enabled', () => {
+      beforeEach(() => {
+        mutableEnv.SKIP_FAILED_ACCOUNTS = true;
+        vi.mocked(syncBudget).mockResolvedValue(undefined);
+        vi.mocked(getAccounts).mockResolvedValue([
+          { id: 'acc-1', name: 'Checking' },
+          { id: 'acc-2', name: 'Savings' },
+          { id: 'acc-3', name: 'Closed', closed: true },
+        ]);
+      });
+
+      it('syncs each non-closed account individually', async () => {
+        vi.mocked(runBankSync).mockResolvedValue(undefined);
+
+        await syncAllAccounts(fakeApi);
+
+        expect(runBankSync).toHaveBeenCalledTimes(2);
+        expect(runBankSync).toHaveBeenCalledWith({ accountId: 'acc-1' });
+        expect(runBankSync).toHaveBeenCalledWith({ accountId: 'acc-2' });
+        expect(runBankSync).not.toHaveBeenCalledWith({ accountId: 'acc-3' });
+        expect(syncBudget).toHaveBeenCalled();
+      });
+
+      it('skips a failing account, logs it, and still syncs the budget', async () => {
+        const error = new Error('internal error');
+        vi.mocked(runBankSync)
+          .mockRejectedValueOnce(error) // acc-1 fails
+          .mockResolvedValue(undefined); // acc-2 succeeds
+
+        await syncAllAccounts(fakeApi);
+
+        expect(runBankSync).toHaveBeenCalledTimes(2);
+        expect(logger.error).toHaveBeenCalledWith(
+          { err: error, accountId: 'acc-1', accountName: 'Checking' },
+          'Bank sync failed for account "Checking"; skipping.',
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          { failedAccounts: ['Checking'] },
+          'Bank sync completed with 1 failed account(s): Checking.',
+        );
+        // Budget still pushed despite the failed account.
+        expect(syncBudget).toHaveBeenCalled();
+      });
+
+      it('logs warn and still syncs the budget when all accounts fail', async () => {
+        const error = new Error('provider down');
+        vi.mocked(getAccounts).mockResolvedValue([
+          { id: 'acc-1', name: 'Checking' },
+          { id: 'acc-2', name: 'Savings' },
+        ]);
+        vi.mocked(runBankSync).mockRejectedValue(error);
+
+        await syncAllAccounts(fakeApi);
+
+        expect(logger.warn).toHaveBeenCalledWith(
+          { failedAccounts: ['Checking', 'Savings'] },
+          'Bank sync completed with 2 failed account(s): Checking, Savings.',
+        );
+        expect(syncBudget).toHaveBeenCalled();
+      });
+
+      it('does not call runBankSync when there are no open accounts', async () => {
+        vi.mocked(getAccounts).mockResolvedValue([{ id: 'acc-1', name: 'Closed', closed: true }]);
+
+        await syncAllAccounts(fakeApi);
+
+        expect(runBankSync).not.toHaveBeenCalled();
+        expect(logger.warn).not.toHaveBeenCalled();
+        expect(syncBudget).toHaveBeenCalled();
+      });
+
+      it('labels a failing unnamed account by its id', async () => {
+        const error = new Error('boom');
+        vi.mocked(getAccounts).mockResolvedValue([{ id: 'acc-x', name: '' }]);
+        vi.mocked(runBankSync).mockRejectedValue(error);
+
+        await syncAllAccounts(fakeApi);
+
+        expect(logger.error).toHaveBeenCalledWith(
+          { err: error, accountId: 'acc-x', accountName: '' },
+          'Bank sync failed for account "acc-x"; skipping.',
+        );
+      });
     });
   });
 
@@ -183,7 +289,7 @@ describe('utils.ts functions', () => {
       ]);
       vi.mocked(mockDb.update).mockResolvedValue(undefined);
 
-      const result = await syncAccountBalancesToCRDT();
+      const result = await syncAccountBalancesToCRDT(fakeApi);
 
       expect(result).toBe(true);
       expect(mockDb.update).toHaveBeenCalledTimes(2);
@@ -197,11 +303,20 @@ describe('utils.ts functions', () => {
       });
     });
 
+    it('should return true when there are no accounts', async () => {
+      vi.mocked(mockDb.getAccounts).mockResolvedValue([]);
+
+      const result = await syncAccountBalancesToCRDT(fakeApi);
+
+      expect(result).toBe(true);
+      expect(mockDb.update).not.toHaveBeenCalled();
+    });
+
     it('should log errors from getAccounts and continue', async () => {
       const error = new Error('DB read failed');
       vi.mocked(mockDb.getAccounts).mockRejectedValue(error);
 
-      const result = await syncAccountBalancesToCRDT();
+      const result = await syncAccountBalancesToCRDT(fakeApi);
 
       expect(result).toBe(false);
       expect(logger.error).toHaveBeenCalledWith(
@@ -218,7 +333,7 @@ describe('utils.ts functions', () => {
       ]);
       vi.mocked(mockDb.update).mockRejectedValueOnce(error).mockResolvedValue(undefined);
 
-      const result = await syncAccountBalancesToCRDT();
+      const result = await syncAccountBalancesToCRDT(fakeApi);
 
       expect(result).toBe(false);
       expect(logger.error).toHaveBeenCalledWith(
@@ -321,7 +436,7 @@ describe('utils.ts functions', () => {
     beforeEach(() => {
       vi.clearAllMocks();
       // Mock successful responses by default
-      vi.mocked(init).mockResolvedValue(undefined as never);
+      vi.mocked(init).mockResolvedValue(fakeApi as unknown as Awaited<ReturnType<typeof init>>);
       vi.mocked(shutdown).mockResolvedValue(undefined as never);
       vi.mocked(downloadBudget).mockResolvedValue(undefined);
       vi.mocked(mkdir).mockResolvedValue(undefined);
@@ -336,6 +451,7 @@ describe('utils.ts functions', () => {
       // Mock getSyncIdMaps to return a mapping that matches the env.ACTUAL_BUDGET_SYNC_IDS
       mutableEnv.ACTUAL_BUDGET_SYNC_IDS = ['budget1', 'budget2'];
       mutableEnv.ENCRYPTION_PASSWORDS = ['pass1', 'pass2'];
+      mutableEnv.LOG_LEVEL = 'info';
       vi.mocked(readdir).mockResolvedValue([
         { name: 'dir1', isDirectory: () => true },
         { name: 'dir2', isDirectory: () => true },
@@ -354,9 +470,26 @@ describe('utils.ts functions', () => {
         dataDir: './data',
         serverURL: 'http://localhost:5006',
         password: 'test-password',
+        verbose: true,
       });
       expect(cronstrueMock.toString).toHaveBeenCalledWith('0 0 * * *');
       expect(shutdown).toHaveBeenCalled();
+    });
+
+    it('initializes the API verbosely when LOG_LEVEL is verbose', async () => {
+      mutableEnv.LOG_LEVEL = 'info';
+
+      await sync();
+
+      expect(init).toHaveBeenCalledWith(expect.objectContaining({ verbose: true }));
+    });
+
+    it('initializes the API quietly when LOG_LEVEL is not verbose', async () => {
+      mutableEnv.LOG_LEVEL = 'warn';
+
+      await sync();
+
+      expect(init).toHaveBeenCalledWith(expect.objectContaining({ verbose: false }));
     });
 
     it('should download budgets without encryption password when password is missing', async () => {
@@ -612,6 +745,23 @@ describe('utils.ts functions', () => {
       await expect(sync()).resolves.toBeUndefined();
 
       expect(logger.error).toHaveBeenCalledWith({ err: error }, 'Error shutting down the service.');
+    });
+
+    it('should log a budget error when init() yields no API handle', async () => {
+      // If init() resolves without a handle, getActualApi() must throw rather
+      // than silently using the deprecated global.
+      vi.mocked(init).mockResolvedValue(undefined as unknown as Awaited<ReturnType<typeof init>>);
+
+      await expect(sync()).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          err: expect.objectContaining({
+            message: 'Actual API is not initialized; init() must run first.',
+          }),
+        }),
+        expect.stringContaining('Error syncing budget'),
+      );
     });
   });
 });

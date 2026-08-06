@@ -14,17 +14,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '24.11.0'
+          node-version: '22.23.1'
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
-          version: 10.21.0
+          version: 11.10.0
           run_install: false
 
       - name: Get pnpm store directory
@@ -33,7 +33,7 @@ jobs:
           echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
 
       - name: Setup pnpm cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ env.STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -59,8 +59,52 @@ jobs:
         run: pnpm test:e2e:docker
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           fail_ci_if_error: false
+
+  # Builds the shipped Dockerfile (the e2e job builds Dockerfile.e2e, so the
+  # production image is otherwise never exercised in CI) for every published
+  # platform, then verifies each image runs unprivileged as uid 1000 and can
+  # load its native better-sqlite3 binary. The arm64 and arm/v7 builds run under
+  # QEMU emulation and catch arch-specific build/prebuild regressions pre-merge,
+  # before the main-branch publish assembles the multi-arch manifest.
+  #
+  # All platforms are exercised in a single job (rather than a matrix) so the
+  # status-check context stays named `docker-image` — a matrix would emit
+  # `docker-image (linux/amd64)` / `(linux/arm64)` instead and break any branch
+  # protection rule that requires the `docker-image` context.
+  docker-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and verify production image (amd64 + arm64 + arm/v7)
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64 linux/arm/v7; do
+            echo "::group::Build + verify ${platform}"
+            docker buildx build --platform "${platform}" --load -t actual-auto-sync:ci .
+
+            uid="$(docker run --rm --platform "${platform}" --entrypoint sh actual-auto-sync:ci -c 'id -u')"
+            echo "runtime uid (${platform}): ${uid}"
+            if [ "${uid}" != "1000" ]; then
+              echo "::error::[${platform}] expected the container to run as uid 1000, got ${uid}"
+              exit 1
+            fi
+
+            # Load the native SQLite binary and run a query — this is the
+            # arch-specific risk (each arch's prebuild must match the runtime ABI).
+            docker run --rm --platform "${platform}" --entrypoint node actual-auto-sync:ci \
+              -e "const D=require('better-sqlite3'); const db=new D(':memory:'); if (db.prepare('select 42 as n').get().n !== 42) { process.exit(1); } console.log('better-sqlite3 OK on', process.arch);"
+            echo "::endgroup::"
+          done

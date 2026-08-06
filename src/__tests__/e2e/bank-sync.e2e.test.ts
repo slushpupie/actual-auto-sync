@@ -353,6 +353,7 @@ describe('E2E: SimpleFIN with Actual Budget Server', () => {
   let seededSyncId: string | undefined;
   let seededAccountId: string;
   let uploadedToServer: boolean;
+  let apiHandle: Awaited<ReturnType<typeof initApi>>;
 
   beforeAll(async () => {
     // Start mock SimpleFIN server
@@ -373,7 +374,7 @@ describe('E2E: SimpleFIN with Actual Budget Server', () => {
 
   it('should seed a test budget for bank sync testing', async () => {
     // Initialize the API
-    await initApi();
+    apiHandle = await initApi();
 
     // Seed a test budget
     const seeded = await seedTestBudget();
@@ -440,6 +441,37 @@ describe('E2E: SimpleFIN with Actual Budget Server', () => {
     }
   });
 
+  it('should run per-account bank sync when SKIP_FAILED_ACCOUNTS is true', async () => {
+    if (!apiHandle) {
+      throw new Error('apiHandle is not initialized — the seeding test must run first');
+    }
+
+    // env.ts is re-evaluated per test under e2e module isolation, so populate
+    // process.env before the import to pass createEnv() validation.
+    process.env.ACTUAL_BUDGET_SYNC_IDS ??= seededSyncId ?? 'e2e-placeholder-sync-id';
+    process.env.ACTUAL_SERVER_URL ??= E2E_CONFIG.serverUrl;
+    process.env.ACTUAL_SERVER_PASSWORD ??= E2E_CONFIG.serverPassword;
+
+    const { env } = await import('../../env.js');
+    const envMut = env as unknown as { SKIP_FAILED_ACCOUNTS: boolean };
+    const originalSkip = envMut.SKIP_FAILED_ACCOUNTS;
+    envMut.SKIP_FAILED_ACCOUNTS = true;
+
+    const { syncAllAccounts: runAutoSyncAllAccounts } = await import('../../utils.js');
+    try {
+      // vi.spyOn on @actual-app/api namespace is not possible in e2e (true ESM,
+      // non-configurable exports). Verify the per-account path ran by asserting
+      // the sync completed without throwing and that open accounts exist in the
+      // seeded budget (so the per-account loop was exercised, not skipped).
+      await runAutoSyncAllAccounts(apiHandle);
+      const allAccounts = await api.getAccounts();
+      const openAccounts = allAccounts.filter((a) => !a.closed);
+      expect(openAccounts.length).toBeGreaterThan(0);
+    } finally {
+      envMut.SKIP_FAILED_ACCOUNTS = originalSkip;
+    }
+  });
+
   it('should sync linked bank balance through CRDT messages', async () => {
     const mockAccount = mockSimpleFinAccounts['ACT-001'];
     expect(mockAccount).toBeDefined();
@@ -468,10 +500,10 @@ describe('E2E: SimpleFIN with Actual Budget Server', () => {
     process.env.ACTUAL_SERVER_URL ??= E2E_CONFIG.serverUrl;
     process.env.ACTUAL_SERVER_PASSWORD ??= E2E_CONFIG.serverPassword;
     const { syncAllAccounts: runAutoSyncAllAccounts } = await import('../../utils.js');
-    await runAutoSyncAllAccounts();
+    await runAutoSyncAllAccounts(apiHandle);
 
     // Verify account has a synced balance value
-    const accountRows = (await api.internal!.db.all(
+    const accountRows = (await apiHandle.db.all(
       'SELECT id, balance_current FROM accounts WHERE id = ?',
       [seededAccountId],
     )) as { id: string; balance_current: number | null }[];
@@ -480,7 +512,7 @@ describe('E2E: SimpleFIN with Actual Budget Server', () => {
     expect(accountRows[0]?.balance_current).not.toBeNull();
 
     // Verify balance_current was emitted as a CRDT message (issue #60 regression guard)
-    const balanceMessages = (await api.internal!.db.all(
+    const balanceMessages = (await apiHandle.db.all(
       "SELECT value FROM messages_crdt WHERE dataset = 'accounts' AND row = ? AND column = 'balance_current' ORDER BY timestamp",
       [seededAccountId],
     )) as { value: string | number | null }[];
@@ -490,7 +522,7 @@ describe('E2E: SimpleFIN with Actual Budget Server', () => {
     const latestMessageValue = decodeCrdtNumber(balanceMessages.at(-1)?.value);
     expect(latestMessageValue).toBe(accountRows[0]?.balance_current);
 
-    const expectedBalance = api.internal!.amountToInteger(normalizedBalance);
+    const expectedBalance = apiHandle.amountToInteger(parsedBalance);
     expect(accountRows[0]?.balance_current).toBe(expectedBalance);
   });
 });

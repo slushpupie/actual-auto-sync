@@ -1,17 +1,20 @@
 import { createEnv } from '@t3-oss/env-core';
 import { config } from 'dotenv';
 import { IANAZone } from 'luxon';
-import { pino } from 'pino';
 import { z } from 'zod';
 
 import { getConfiguration } from './docker-secret.js';
+import { isVerbose, logger } from './logger.js';
 
-const logger = pino({
-  level: 'info',
-});
+// Apply LOG_LEVEL as early as possible so dotenv and startup logs honor it.
+// At this point only system env is available (the .env file is loaded below),
+// which is enough to decide verbosity; the validated value is reapplied later.
+const earlyLogLevel = process.env.LOG_LEVEL ?? 'info';
+logger.level = earlyLogLevel;
 
 try {
-  config();
+  // `quiet` suppresses dotenv's own injection banner when not running verbose.
+  config({ quiet: !isVerbose(earlyLogLevel) });
   logger.info('Loaded environment variables from .env file.');
 } catch (error) {
   logger.warn({ err: error }, 'Unable to load .env file. Using system environment variables.');
@@ -37,35 +40,50 @@ export const encryptionPasswordSchema = z
 export const cronScheduleSchema = z.string().trim().min(9).default('0 1 * * *');
 
 /**
+ * Builds a schema that parses common truthy/falsy string representations (and
+ * real booleans) into a boolean, defaulting to `false` for unknown values.
+ */
+function flexibleBooleanSchema() {
+  return z
+    .union([z.string(), z.boolean()])
+    .optional()
+    .default(false)
+    .transform((value) => {
+      const loweredValue = typeof value === 'string' ? value.trim().toLowerCase() : value;
+      switch (loweredValue) {
+        case true:
+        case 'on':
+        case 'yes':
+        case '1':
+        case 'true': {
+          return true;
+        }
+        case false:
+        case 'off':
+        case 'no':
+        case '0':
+        case 'false': {
+          return false;
+        }
+        default: {
+          return false;
+        }
+      }
+    });
+}
+
+/**
  * Default to false
  * @default false
  */
-export const runOnStartSchema = z
-  .union([z.string(), z.boolean()])
-  .optional()
-  .default(false)
-  .transform((value) => {
-    const loweredValue = typeof value === 'string' ? value.trim().toLowerCase() : value;
-    switch (loweredValue) {
-      case true:
-      case 'on':
-      case 'yes':
-      case '1':
-      case 'true': {
-        return true;
-      }
-      case false:
-      case 'off':
-      case 'no':
-      case '0':
-      case 'false': {
-        return false;
-      }
-      default: {
-        return false;
-      }
-    }
-  });
+export const runOnStartSchema = flexibleBooleanSchema();
+
+/**
+ * When true, bank sync runs per-account and skips accounts that fail instead of
+ * aborting the whole budget. Default false (single all-accounts sync).
+ * @default false
+ */
+export const skipFailedAccountsSchema = flexibleBooleanSchema();
 
 /**
  * Default to info
@@ -93,6 +111,13 @@ export const serverUrlSchema = z.string().trim().min(1);
  * Server password
  */
 export const serverPasswordSchema = z.string().min(1);
+
+/**
+ * Directory where the Actual API writes budget data and caches. Override it to a
+ * mounted/tmpfs path so the container can run with a read-only root filesystem.
+ * @default "./data"
+ */
+export const actualDataDirSchema = z.string().trim().min(1).default('./data');
 
 export const env = createEnv({
   client: {},
@@ -123,23 +148,31 @@ export const env = createEnv({
    */
   runtimeEnv: {
     ACTUAL_BUDGET_SYNC_IDS: await getConfiguration('ACTUAL_BUDGET_SYNC_IDS'),
+    ACTUAL_DATA_DIR: await getConfiguration('ACTUAL_DATA_DIR'),
     ACTUAL_SERVER_PASSWORD: await getConfiguration('ACTUAL_SERVER_PASSWORD'),
     ACTUAL_SERVER_URL: await getConfiguration('ACTUAL_SERVER_URL'),
     CRON_SCHEDULE: await getConfiguration('CRON_SCHEDULE'),
     ENCRYPTION_PASSWORDS: await getConfiguration('ENCRYPTION_PASSWORDS'),
     LOG_LEVEL: await getConfiguration('LOG_LEVEL'),
     RUN_ON_START: await getConfiguration('RUN_ON_START'),
+    SKIP_FAILED_ACCOUNTS: await getConfiguration('SKIP_FAILED_ACCOUNTS'),
     TIMEZONE: await getConfiguration('TIMEZONE'),
   },
 
   server: {
     ACTUAL_BUDGET_SYNC_IDS: budgetIdSchema,
+    ACTUAL_DATA_DIR: actualDataDirSchema,
     ACTUAL_SERVER_PASSWORD: serverPasswordSchema,
     ACTUAL_SERVER_URL: serverUrlSchema,
     CRON_SCHEDULE: cronScheduleSchema,
     ENCRYPTION_PASSWORDS: encryptionPasswordSchema,
     LOG_LEVEL: logLevelSchema,
     RUN_ON_START: runOnStartSchema,
+    SKIP_FAILED_ACCOUNTS: skipFailedAccountsSchema,
     TIMEZONE: timezoneSchema,
   },
 });
+
+// Reapply the validated level (which may come from a docker secret rather than
+// process.env) now that the full configuration has been parsed.
+logger.level = env.LOG_LEVEL;
